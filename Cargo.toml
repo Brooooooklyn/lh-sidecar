@@ -1,0 +1,22 @@
+[package]
+authors = ["LongYinan <longyinan.brooklyn@bytedance.com>"]
+edition = "2018"
+name = "lh-sidecar"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3"
+hyper = {version = "0.14", features = ["tcp", "http1", "http2", "server", "stream"]}
+tokio = {version = "1", features = [
+  "fs",
+  "macros",
+  "io-std",
+  "io-util",
+  "rt",
+  "rt-multi-thread", # so examples can use #[tokio::main]
+  "sync",
+  "time",
+  "test-util",
+]}
