@@ -7,8 +7,12 @@ version = "0.1.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bytes = "1.0"
 futures = "0.3"
+http = "0.2"
+httparse = "1.0"
 hyper = {version = "0.14", features = ["tcp", "http1", "http2", "server", "stream"]}
+time = "0.2"
 tokio = {version = "1", features = [
   "fs",
   "macros",
@@ -20,3 +24,4 @@ tokio = {version = "1", features = [
   "time",
   "test-util",
 ]}
+tokio-util = {version = "0.6.3", features = ["full"]}
