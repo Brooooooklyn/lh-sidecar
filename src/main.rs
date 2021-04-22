@@ -1,162 +1,148 @@
-use std::{error::Error, fmt, io};
-
-use bytes::BytesMut;
-use futures::{FutureExt, SinkExt};
-use http::{header::HeaderValue, Request, Response, StatusCode};
-use tokio::io::{self as tokio_io, AsyncWriteExt};
+//! Simple HTTPS echo service based on hyper-rustls
+//!
+//! First parameter is the mandatory port to use.
+//! Certificate and private key are hardcoded to sample files.
+//! hyper will automatically use HTTP/2 if a client starts talking HTTP/2,
+//! otherwise HTTP/1.1 will be used.
+use async_stream::stream;
+use core::task::{Context, Poll};
+use futures::{future::TryFutureExt, stream::Stream};
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use rustls::internal::pemfile;
+use std::pin::Pin;
+use std::vec::Vec;
+use std::{env, fs, io, sync};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
+
+fn main() {
+  // Serve an echo service over HTTPS, with proper error handling.
+  if let Err(e) = run_server() {
+    eprintln!("FAILED: {}", e);
+    std::process::exit(1);
+  }
+}
+
+fn error(err: String) -> io::Error {
+  io::Error::new(io::ErrorKind::Other, err)
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-  let listen_addr = "127.0.0.1:8081".to_string();
-  let server_addr = "127.0.0.1:8080".to_string();
+async fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  // First parameter is port number (optional, defaults to 1337)
+  let port = match env::args().nth(1) {
+    Some(ref p) => p.to_owned(),
+    None => "1337".to_owned(),
+  };
+  let addr = format!("127.0.0.1:{}", port);
 
-  let listener = TcpListener::bind(listen_addr).await?;
+  // Build TLS configuration.
+  let tls_cfg = {
+    // Load public certificate.
+    let certs = load_certs("examples/sample.pem")?;
+    // Load private key.
+    let key = load_private_key("examples/sample.rsa")?;
+    // Do not use client certificate authentication.
+    let mut cfg = rustls::ServerConfig::new(rustls::NoClientAuth::new());
+    // Select a certificate to use.
+    cfg
+      .set_single_cert(certs, key)
+      .map_err(|e| error(format!("{}", e)))?;
+    // Configure ALPN to accept HTTP/2, HTTP/1.1 in that order.
+    cfg.set_protocols(&[b"h2".to_vec(), b"http/1.1".to_vec()]);
+    sync::Arc::new(cfg)
+  };
 
-  while let Ok((inbound, _)) = listener.accept().await {
-    let transfer = transfer(inbound, server_addr.clone()).map(|r| {
-      if let Err(e) = r {
-        println!("Failed to transfer; error={}", e);
+  // Create a TCP listener via tokio.
+  let tcp = TcpListener::bind(&addr).await?;
+  let tls_acceptor = TlsAcceptor::from(tls_cfg);
+  // Prepare a long-running future stream to accept and serve clients.
+  let incoming_tls_stream = stream! {
+      loop {
+          let (socket, _) = tcp.accept().await?;
+          let stream = tls_acceptor.accept(socket).map_err(|e| {
+              println!("[!] Voluntary server halt due to client-connection error...");
+              // Errors could be handled here, instead of server aborting.
+              // Ok(None)
+              error(format!("TLS Error: {:?}", e))
+          });
+          yield stream.await;
       }
-    });
+  };
+  let service = make_service_fn(|_| async { Ok::<_, io::Error>(service_fn(echo)) });
+  let server = Server::builder(HyperAcceptor {
+    acceptor: Box::pin(incoming_tls_stream),
+  })
+  .serve(service);
 
-    tokio::spawn(transfer);
-  }
-
+  // Run the future, keep going until an error occurs.
+  println!("Starting to serve on https://{}.", addr);
+  server.await?;
   Ok(())
 }
 
-async fn transfer(mut inbound: TcpStream, proxy_addr: String) -> Result<(), Box<dyn Error>> {
-  let mut transport = Framed::new(inbound, Http);
-
-  Ok(())
+struct HyperAcceptor<'a> {
+  acceptor: Pin<Box<dyn Stream<Item = Result<TlsStream<TcpStream>, io::Error>> + 'a>>,
 }
 
-struct Http;
-
-/// Implementation of encoding an HTTP response into a `BytesMut`, basically
-/// just writing out an HTTP/1.1 response.
-impl Encoder<Response<String>> for Http {
+impl hyper::server::accept::Accept for HyperAcceptor<'_> {
+  type Conn = TlsStream<TcpStream>;
   type Error = io::Error;
 
-  fn encode(&mut self, item: Response<String>, dst: &mut BytesMut) -> io::Result<()> {
-    use std::fmt::Write;
-
-    write!(
-      BytesWrite(dst),
-      "\
-             HTTP/1.1 {}\r\n\
-             Server: Example\r\n\
-             Content-Length: {}\r\n\
-             Date: {:?}\r\n\
-             ",
-      item.status(),
-      item.body().len(),
-      time::Instant::now(),
-    )
-    .unwrap();
-
-    for (k, v) in item.headers() {
-      dst.extend_from_slice(k.as_str().as_bytes());
-      dst.extend_from_slice(b": ");
-      dst.extend_from_slice(v.as_bytes());
-      dst.extend_from_slice(b"\r\n");
-    }
-
-    dst.extend_from_slice(b"\r\n");
-    dst.extend_from_slice(item.body().as_bytes());
-
-    return Ok(());
-
-    // Right now `write!` on `Vec<u8>` goes through io::Write and is not
-    // super speedy, so inline a less-crufty implementation here which
-    // doesn't go through io::Error.
-    struct BytesWrite<'a>(&'a mut BytesMut);
-
-    impl fmt::Write for BytesWrite<'_> {
-      fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.extend_from_slice(s.as_bytes());
-        Ok(())
-      }
-
-      fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
-        fmt::write(self, args)
-      }
-    }
+  fn poll_accept(
+    mut self: Pin<&mut Self>,
+    cx: &mut Context,
+  ) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
+    Pin::new(&mut self.acceptor).poll_next(cx)
   }
 }
 
-/// Implementation of decoding an HTTP request from the bytes we've read so far.
-/// This leverages the `httparse` crate to do the actual parsing and then we use
-/// that information to construct an instance of a `http::Request` object,
-/// trying to avoid allocations where possible.
-impl Decoder for Http {
-  type Item = Request<()>;
-  type Error = io::Error;
-
-  fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<Request<()>>> {
-    // TODO: we should grow this headers array if parsing fails and asks
-    //       for more headers
-    let mut headers = [None; 128];
-    let (method, path, version, amt) = {
-      let mut parsed_headers = [httparse::EMPTY_HEADER; 128];
-      let mut r = httparse::Request::new(&mut parsed_headers);
-      let status = r.parse(src).map_err(|e| {
-        let msg = format!("failed to parse http request: {:?}", e);
-        io::Error::new(io::ErrorKind::Other, msg)
-      })?;
-
-      let amt = match status {
-        httparse::Status::Complete(amt) => amt,
-        httparse::Status::Partial => return Ok(None),
-      };
-
-      let toslice = |a: &[u8]| {
-        let start = a.as_ptr() as usize - src.as_ptr() as usize;
-        assert!(start < src.len());
-        (start, start + a.len())
-      };
-
-      for (i, header) in r.headers.iter().enumerate() {
-        let k = toslice(header.name.as_bytes());
-        let v = toslice(header.value);
-        headers[i] = Some((k, v));
-      }
-
-      (
-        toslice(r.method.unwrap().as_bytes()),
-        toslice(r.path.unwrap().as_bytes()),
-        r.version.unwrap(),
-        amt,
-      )
-    };
-    if version != 1 {
-      return Err(io::Error::new(
-        io::ErrorKind::Other,
-        "only HTTP/1.1 accepted",
-      ));
+// Custom echo service, handling two different routes and a
+// catch-all 404 responder.
+async fn echo(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+  let mut response = Response::new(Body::empty());
+  match (req.method(), req.uri().path()) {
+    // Help route.
+    (&Method::GET, "/") => {
+      *response.body_mut() = Body::from("Try POST /echo\n");
     }
-    let data = src.split_to(amt).freeze();
-    let mut ret = Request::builder();
-    ret = ret.method(&data[method.0..method.1]);
-    let s = data.slice(path.0..path.1);
-    let s = unsafe { String::from_utf8_unchecked(Vec::from(s.as_ref())) };
-    ret = ret.uri(s);
-    ret = ret.version(http::Version::HTTP_11);
-    for header in headers.iter() {
-      let (k, v) = match *header {
-        Some((ref k, ref v)) => (k, v),
-        None => break,
-      };
-      let value = HeaderValue::from_bytes(data.slice(v.0..v.1).as_ref())
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "header decode error"))?;
-      ret = ret.header(&data[k.0..k.1], value);
+    // Echo service route.
+    (&Method::POST, "/echo") => {
+      *response.body_mut() = req.into_body();
     }
+    // Catch-all 404.
+    _ => {
+      *response.status_mut() = StatusCode::NOT_FOUND;
+    }
+  };
+  Ok(response)
+}
 
-    let req = ret
-      .body(())
-      .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(Some(req))
+// Load public certificate from file.
+fn load_certs(filename: &str) -> io::Result<Vec<rustls::Certificate>> {
+  // Open certificate file.
+  let certfile =
+    fs::File::open(filename).map_err(|e| error(format!("failed to open {}: {}", filename, e)))?;
+  let mut reader = io::BufReader::new(certfile);
+
+  // Load and return certificate.
+  pemfile::certs(&mut reader).map_err(|_| error("failed to load certificate".into()))
+}
+
+// Load private key from file.
+fn load_private_key(filename: &str) -> io::Result<rustls::PrivateKey> {
+  // Open keyfile.
+  let keyfile =
+    fs::File::open(filename).map_err(|e| error(format!("failed to open {}: {}", filename, e)))?;
+  let mut reader = io::BufReader::new(keyfile);
+
+  // Load and return a single private key.
+  let keys = pemfile::rsa_private_keys(&mut reader)
+    .map_err(|_| error("failed to load private key".into()))?;
+  if keys.len() != 1 {
+    return Err(error("expected a single private key".into()));
   }
+  Ok(keys[0].clone())
 }
